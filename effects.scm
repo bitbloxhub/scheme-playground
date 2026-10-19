@@ -1,6 +1,7 @@
 (import (scheme base)
         (scheme write)
-        (gauche base))
+        (gauche base)
+        (gauche dictionary))
 
 ;; All effect operations derive from this.
 (define-class <effect> ()
@@ -27,11 +28,92 @@
         :effect effect
         :continuation pure))
 
+(define-method bind ((c <pure>) f)
+               (f (slot-ref c 'value)))
+
+(define-method bind ((c <effectful>) f)
+               (make <effectful>
+                     :effect (slot-ref c 'effect)
+                     :continuation
+                     (lambda (value)
+                       (bind ((slot-ref c 'continuation) value) f))))
+
+(define-class <effect-handler> () ())
+
+(define-class <runtime> ()
+              ((handlers :init-form (make-hash-table 'eq?))))
+
+(define-method register-handler!
+               ((runtime <runtime>) effect-class (handler <effect-handler>))
+               (dict-put! (slot-ref runtime 'handlers)
+                          effect-class
+                          handler))
+
+(define-method find-handler
+               ((runtime <runtime>) (effect <effect>))
+               (or (dict-get (slot-ref runtime 'handlers)
+                             (class-of effect)
+                             #f)
+                   (error "Unhandled effect:" effect)))
+
 ;; our first effects, write and newline
 (define-class <write-effect> (<effect>)
-              (value :init-keyword :value))
+              ((value :init-keyword :value)))
 
 (define-class <newline-effect> (<effect>)
               ())
 
-; TODO: implement
+(define-class <io-handler> (<effect-handler>)
+              ((port :init-keyword :port
+                     :init-form (current-output-port))))
+
+(define-method handle
+               ((handler <io-handler>) (effect <write-effect>) resume)
+               (display (slot-ref effect 'value)
+                      (slot-ref handler 'port))
+               (resume '()))
+
+(define-method handle
+               ((handler <io-handler>) (effect <newline-effect>) resume)
+               (newline (slot-ref handler 'port))
+               (resume '()))
+
+(define-method run ((c <pure>) (runtime <runtime>))
+               (slot-ref c 'value))
+
+(define-method run ((c <effectful>) (runtime <runtime>))
+               (let ((effect (slot-ref c 'effect))
+                     (k (slot-ref c 'continuation)))
+                 (handle (find-handler runtime effect)
+                         effect
+                         (lambda (value)
+                           (run (k value) runtime)))))
+
+(define-syntax effect-do
+  (syntax-rules (<-)
+    ;; Sequential case
+    ((_ (name <- expr) rest ...)
+     (bind expr
+           (lambda (name)
+             (effect-do rest ...))))
+    ;; Base case: return the final expression unchanged
+    ((_ final)
+     final)
+    ;; Empty case: missing final computation
+    ((_)
+     (syntax-error "effect-do: Did you forget a final expression, such as (pure '())?"))
+    ;; Catch-all error case
+    ((_ . invalid)
+     (syntax-error "Invalid effect-do syntax:" (effect-do . invalid)))))
+
+(let ((runtime (make <runtime>))
+      (io (make <io-handler>))
+      (computation
+        (effect-do
+          (message <- (pure "Hello from effect-do!"))
+          (_ <- (perform (make <write-effect> :value message)))
+          (_ <- (perform (make <newline-effect>)))
+          (pure '()))))
+  (register-handler! runtime <write-effect> io)
+  (register-handler! runtime <newline-effect> io)
+  (run computation runtime))
