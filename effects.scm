@@ -6,13 +6,12 @@
         (srfi 18)
         (scheme time))
 
-;; All effect operations derive from this.
 (define-class <effect> ()
               ())
 
-;; A computation is either:
-;;   - a completed value
-;;   - a suspended effect + continuation
+;; Freer-monad-style representation: pure values or effect operations
+;; paired with explicit result continuations. Continuations stay separate
+;; from operations, so each effect needs no mapping operation.
 (define-class <computation> ()
               ())
 
@@ -23,14 +22,18 @@
               ((effect :init-keyword :effect)
                (continuation :init-keyword :continuation)))
 
+;; Build a computation that has already produced x.
 (define (pure x)
   (make <pure> :value x))
 
+;; Suspend effect until `run` finds its handler.
 (define (perform effect)
   (make <effectful>
         :effect effect
         :continuation pure))
 
+;; Sequence computations by applying f now for pure values, or later
+;; through the stored continuation for suspended effects.
 (define-method bind ((c <pure>) f)
                (f (slot-ref c 'value)))
 
@@ -46,12 +49,14 @@
 (define-class <runtime> ()
               ((handlers :init-form (make-hash-table 'eq?))))
 
+;; Each runtime maps an effect's exact class to its handler.
 (define-method register-handler!
                ((runtime <runtime>) effect-class (handler <effect-handler>))
                (dict-put! (slot-ref runtime 'handlers)
                           effect-class
                           handler))
 
+;; Resolve handlers by exact effect class; missing handlers raise an error.
 (define-method find-handler
                ((runtime <runtime>) (effect <effect>))
                (or (dict-get (slot-ref runtime 'handlers)
@@ -59,6 +64,8 @@
                              #f)
                    (error "Unhandled effect:" effect)))
 
+;; Interpret pure values directly; effectful computations delegate to
+;; the selected handler and recursively interpret resumed computations.
 (define-method run ((c <pure>) (runtime <runtime>))
                (slot-ref c 'value))
 
@@ -92,7 +99,9 @@
                (newline (slot-ref handler 'port))
                (resume '()))
 
-;; Parallel effects!
+;; The parallel effect handler runs child computations in Gauche futures,
+;; then blocks on each result in input order. Failures do not guarantee
+;; sibling cancellation or cleanup.
 (define-class <parallel-effect> (<effect>)
               ((computations :init-keyword :computations)))
 
@@ -117,12 +126,14 @@
 
 (define-class <sleep-handler> (<effect-handler>) ())
 
+;; Sleep synchronously, then resume with the requested duration.
 (define-method handle
                ((handler <sleep-handler>) (effect <sleep-effect>) resume)
                (thread-sleep! (slot-ref effect 'seconds))
                (resume (slot-ref effect 'seconds)))
 
-;; A macro to make it nicer to use effects
+;; Provide syntax for named sequential binds and `parallel` groups, binding
+;; each group's results to its listed names in input order.
 (define-syntax effect-do
   (syntax-rules (<- parallel)
     ;; Parallel sugar
